@@ -682,6 +682,101 @@ class MibParser:
 
         return None
 
+
+class LanguageManager:
+    """Gestisce le traduzioni caricate da languages.json"""
+
+    def __init__(self, logger=None, default_language="en"):
+        self.logger = logger
+        self.default_language = default_language
+        self.current_language = default_language
+        self.languages = {}
+        self.translations = {}
+
+    def load_from_file(self, file_path):
+        """Carica le traduzioni dal file JSON"""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            self.languages = data.get('languages', {})
+            if not self.languages:
+                raise ValueError("Nessuna lingua trovata nel file")
+
+            self.set_language(self.current_language)
+
+            if self.logger:
+                self.logger.info(
+                    f"Sistema lingue caricato da {file_path}: {len(self.languages)} lingue disponibili"
+                )
+            return True
+
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Errore caricamento lingue da {file_path}: {e}")
+            self.languages = {}
+            self.translations = {}
+            return False
+
+    def set_language(self, language_code):
+        """Imposta la lingua corrente"""
+        if not self.languages:
+            self.current_language = self.default_language
+            self.translations = {}
+            return False
+
+        if language_code not in self.languages:
+            language_code = self.default_language
+
+        if language_code not in self.languages:
+            language_code = next(iter(self.languages.keys()))
+
+        self.current_language = language_code
+        self.translations = self.languages.get(language_code, {}).get('translations', {})
+        return True
+
+    def translate(self, key, default=None, **kwargs):
+        """Restituisce traduzione per la chiave richiesta"""
+        text = self.translations.get(key)
+
+        if text is None and self.languages:
+            default_translations = self.languages.get(self.default_language, {}).get('translations', {})
+            text = default_translations.get(key)
+
+        if text is None:
+            text = default if default is not None else key
+
+        try:
+            if kwargs:
+                return text.format(**kwargs)
+        except Exception:
+            pass
+
+        return text
+
+    def get_available_languages(self):
+        """Restituisce le lingue disponibili come {code: name}"""
+        return {
+            code: data.get('name', code)
+            for code, data in self.languages.items()
+        }
+
+
+class LocalizedStringVar(tk.StringVar):
+    """StringVar che localizza automaticamente il testo in output"""
+
+    def __init__(self, *args, localizer=None, **kwargs):
+        self._localizer = localizer
+        initial_value = kwargs.pop('value', None)
+        super().__init__(*args, **kwargs)
+        if initial_value is not None:
+            self.set(initial_value)
+
+    def set(self, value):
+        if self._localizer and isinstance(value, str):
+            value = self._localizer(value)
+        super().set(value)
+
 class SnmpBrowserGUI:
     """Interfaccia grafica SNMP Browser Production Ready con Monitoring Avanzato"""
 
@@ -762,12 +857,20 @@ class SnmpBrowserGUI:
         # Dizionario OID
         self.oid_names = self._build_oid_names_dictionary()
 
+        # Sistema lingue (default: inglese)
+        self.language_manager = LanguageManager(self.logger, default_language="en")
+        self.current_language = "en"
+        self.load_languages()
+
+        # Carica configurazione prima di creare l'interfaccia
+        self.load_config()
+        self._setup_runtime_localization()
+        self.root.title(self._("app_title", "SNMP Browser - Production Ready"))
+
         # Crea interfaccia
         self.create_widgets()
         self.create_menu()
 
-        # Carica configurazione
-        self.load_config()
         self.load_saved_values()
         self.load_rules()
         self.load_email_config()
@@ -776,6 +879,7 @@ class SnmpBrowserGUI:
         # Bind eventi
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.version_var.trace('w', self.on_version_change)
+        self.on_version_change()
 
         # Monitor memoria
         self.start_memory_monitor()
@@ -950,6 +1054,487 @@ class SnmpBrowserGUI:
             "1.3.6.1.4.1": "enterprises",
         }
 
+    def load_languages(self):
+        """Carica file lingue e imposta inglese come default"""
+        candidates = []
+
+        if hasattr(sys, '_MEIPASS'):
+            candidates.append(os.path.join(sys._MEIPASS, 'languages.json'))
+
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'languages.json'))
+        candidates.append(self._get_data_file_path('languages.json'))
+
+        languages_loaded = False
+        for path in candidates:
+            if os.path.exists(path):
+                languages_loaded = self.language_manager.load_from_file(path)
+                if languages_loaded:
+                    break
+
+        if not languages_loaded:
+            self.logger.warning("languages.json non trovato: verranno usati testi fallback")
+
+        self.language_manager.set_language(self.current_language)
+        self.current_language = self.language_manager.current_language
+
+    def _(self, key, default=None, **kwargs):
+        """Helper traduzioni"""
+        return self.language_manager.translate(key, default=default, **kwargs)
+
+    def set_language(self, language_code, persist=False, refresh_ui=False):
+        """Imposta la lingua dell'applicazione"""
+        previous_language = self.current_language
+
+        self.language_manager.set_language(language_code)
+        self.current_language = self.language_manager.current_language
+        self.root.title(self._("app_title", "SNMP Browser - Production Ready"))
+
+        if refresh_ui:
+            self.create_menu()
+
+        if persist:
+            self.save_config()
+
+        return self.current_language != previous_language
+
+    def show_language_selector(self):
+        """Mostra dialog per selezione lingua"""
+        available_languages = self.language_manager.get_available_languages()
+        if not available_languages:
+            messagebox.showerror(
+                self._("error", "Error"),
+                "No languages are available. Ensure languages.json is present."
+            )
+            return
+
+        language_window = tk.Toplevel(self.root)
+        language_window.title(f"🌍 {self._('select_language', 'Select Language')}")
+        language_window.geometry("360x170")
+        language_window.transient(self.root)
+        language_window.grab_set()
+
+        container = ttk.Frame(language_window)
+        container.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+        ttk.Label(
+            container,
+            text=f"{self._('select_language', 'Select Language')}:"
+        ).pack(anchor='w', pady=(0, 6))
+
+        codes = sorted(available_languages.keys(), key=lambda c: available_languages[c].lower())
+        display_to_code = {
+            f"{available_languages[code]} ({code})": code
+            for code in codes
+        }
+        values = list(display_to_code.keys())
+
+        selected_display = next(
+            (display for display, code in display_to_code.items() if code == self.current_language),
+            values[0]
+        )
+        selected_var = tk.StringVar(value=selected_display)
+
+        language_combo = ttk.Combobox(container, state='readonly', textvariable=selected_var, values=values)
+        language_combo.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(
+            container,
+            text="The language preference is saved and applied on restart."
+        ).pack(anchor='w', pady=(0, 10))
+
+        button_frame = ttk.Frame(container)
+        button_frame.pack(fill=tk.X)
+
+        def apply_selected_language():
+            selected_code = display_to_code.get(selected_var.get(), self.current_language)
+            changed = self.set_language(selected_code, persist=True, refresh_ui=True)
+            language_window.destroy()
+
+            if changed:
+                messagebox.showinfo(
+                    self._("language", "Language"),
+                    "Language updated. Restart the application to refresh all labels."
+                )
+
+        ttk.Button(
+            button_frame,
+            text=self._("apply", "Apply"),
+            command=apply_selected_language
+        ).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(
+            button_frame,
+            text=self._("cancel", "Cancel"),
+            command=language_window.destroy
+        ).pack(side=tk.RIGHT)
+
+    def _setup_runtime_localization(self):
+        """Abilita localizzazione runtime per popup e status text"""
+        self._build_runtime_replacement_maps()
+        self._patch_messagebox_functions()
+        self._patch_filedialog_functions()
+        self._patch_simpledialog_functions()
+        self._patch_window_title_functions()
+
+    def _build_runtime_replacement_maps(self):
+        """Costruisce mappe di sostituzione testo runtime IT <-> EN"""
+        self._runtime_phrase_map_it_to_en = {
+            "Sistema OK - Nessun alert attivo": "System OK - No active alerts",
+            "ALERT ATTIVI - Verificare le regole violate": "ACTIVE ALERTS - Check triggered rules",
+            "Dashboard vuoto": "Dashboard is empty",
+            "Aggiornamento dashboard...": "Updating dashboard...",
+            "Auto-refresh attivo": "Auto-refresh active",
+            "Auto-refresh disattivato": "Auto-refresh disabled",
+            "Errore Dashboard": "Dashboard Error",
+            "Errore Scansione": "Scan Error",
+            "Errore WALK": "WALK Error",
+            "Errore Walk": "Walk Error",
+            "Errore GET": "GET Error",
+            "Errore Export": "Export Error",
+            "Errore caricamento": "Load Error",
+            "Errore Test": "Test Error",
+            "Errore Critico": "Critical Error",
+            "Import MIB Completato": "MIB Import Complete",
+            "Importazione MIB": "MIB Import",
+            "Gestione MIB Custom": "Custom MIB Management",
+            "Gestione Regole Alert": "Alert Rules Management",
+            "Storia Alert": "Alert History",
+            "Configurazione Email": "Email Configuration",
+            "Carica Configurazione": "Load Configuration",
+            "Posizione Dati": "Data Location",
+            "Apri Cartella": "Open Folder",
+            "Pulisci Cache": "Clear Cache",
+            "Walk Completo": "Full Walk",
+            "SET Valore SNMP": "Set SNMP Value",
+            "Info": "Info",
+            "Avviso": "Warning",
+            "Conferma": "Confirm",
+            "Successo": "Success",
+            "Guida": "Help",
+            "Vuoi aprire la cartella dati?": "Do you want to open the data folder?",
+            "Impossibile aprire cartella": "Unable to open folder",
+            "Compilare tutti i campi richiesti": "Fill in all required fields",
+            "Selezionare una regola da modificare": "Select a rule to edit",
+            "Selezionare una regola da rimuovere": "Select a rule to remove",
+            "Regola modificata con successo": "Rule updated successfully",
+            "Regola aggiunta con successo": "Rule added successfully",
+            "Regola rimossa": "Rule removed",
+            "Configurazione email salvata": "Email configuration saved",
+            "Email di test inviata con successo!": "Test email sent successfully!",
+            "Errore invio email": "Email sending error",
+            "Cancellare tutta la storia degli alert?": "Clear all alert history?",
+            "Alert resettati": "Alerts reset",
+            "Selezionare un elemento dal dashboard": "Select an item from the dashboard",
+            "Selezionare un elemento": "Select an item",
+            "Seleziona un elemento": "Select an item",
+            "Inserire una soglia per testare": "Enter a threshold to test",
+            "Inserire una soglia": "Enter a threshold",
+            "Nessun dato storico disponibile per questo elemento": "No historical data available for this item",
+            "Nessun risultato da esportare": "No results to export",
+            "Vuoi aprire il file esportato?": "Do you want to open the exported file?",
+            "Errore durante export": "Error during export",
+            "Configurazione caricata con successo!": "Configuration loaded successfully!",
+            "Impossibile avviare l'applicazione": "Unable to start application",
+            "Pulire tutti i risultati e la cache?": "Clear all results and cache?",
+            "Cache pulita": "Cache cleared",
+            "Rimuovere tutti gli elementi?": "Remove all items?",
+            "Seleziona elementi da rimuovere": "Select items to remove",
+            "Effettua prima una scansione": "Run a scan first",
+            "Eseguire WALK da": "Run WALK from",
+            "Potrebbe generare molti risultati.": "This may generate many results.",
+            "Valore impostato con successo!": "Value set successfully!",
+            "Impossibile impostare il valore": "Unable to set value",
+            "Nessun valore per": "No value for",
+            "Livello log impostato a": "Log level set to",
+            "Password cancellate dalla memoria": "Passwords cleared from memory",
+            "Interrompere e uscire?": "Stop scanning and exit?",
+            "Aggiunti": "Added",
+            "elementi al dashboard": "items to dashboard",
+            "OID copiato": "OID copied",
+            "Albero MIB costruito con": "MIB tree built with",
+            "Test connessione...": "Testing connection...",
+            "Test riuscito": "Test successful",
+            "SNMP non risponde": "SNMP not responding",
+            "Test fallito": "Test failed",
+            "Discovery fallito": "Discovery failed",
+            "Scansione in corso...": "Scanning...",
+            "Scansione completata": "Scan completed",
+            "Interruzione...": "Stopping...",
+            "WALK completato": "WALK completed",
+            "Walk completo in corso...": "Full walk in progress...",
+            "Walk completato": "Walk completed",
+            "Pulisci": "Clear",
+            "Rimuovi": "Remove",
+            "Costruisci": "Build",
+            "Aggiorna": "Refresh",
+            "Comprimi": "Collapse",
+            "Espandi": "Expand",
+            "Mostra": "Show",
+            "Chiudi": "Close"
+        }
+
+        self._runtime_word_map_it_to_en = {
+            "Configurazione": "Configuration",
+            "configurazione": "configuration",
+            "caricata": "loaded",
+            "caricato": "loaded",
+            "salvata": "saved",
+            "salvato": "saved",
+            "Errore": "Error",
+            "errore": "error",
+            "Avviso": "Warning",
+            "Conferma": "Confirm",
+            "Successo": "Success",
+            "Regola": "Rule",
+            "regola": "rule",
+            "Regole": "Rules",
+            "regole": "rules",
+            "Selezionare": "Select",
+            "Seleziona": "Select",
+            "selezionare": "select",
+            "seleziona": "select",
+            "elemento": "item",
+            "elementi": "items",
+            "Nessun": "No",
+            "nessun": "no",
+            "Nessuna": "No",
+            "nessuna": "no",
+            "risultato": "result",
+            "risultati": "results",
+            "completata": "completed",
+            "completato": "completed",
+            "cartella": "folder",
+            "dati": "data",
+            "storia": "history",
+            "Storia": "History",
+            "vuoto": "empty",
+            "pulita": "cleared",
+            "rimosso": "removed",
+            "rimossa": "removed",
+            "rimuovere": "remove",
+            "aggiunta": "added",
+            "modificata": "updated",
+            "impossibile": "unable",
+            "attivo": "active",
+            "disattivato": "disabled"
+        }
+
+        self._runtime_phrase_map_en_to_it = {
+            dst: src
+            for src, dst in self._runtime_phrase_map_it_to_en.items()
+        }
+        self._runtime_word_map_en_to_it = {
+            "Configuration": "Configurazione",
+            "configuration": "configurazione",
+            "loaded": "caricata",
+            "saved": "salvata",
+            "Error": "Errore",
+            "error": "errore",
+            "Warning": "Avviso",
+            "Confirm": "Conferma",
+            "Success": "Successo",
+            "Rule": "Regola",
+            "rule": "regola",
+            "Rules": "Regole",
+            "rules": "regole",
+            "Select": "Seleziona",
+            "select": "seleziona",
+            "item": "elemento",
+            "items": "elementi",
+            "No": "Nessun",
+            "result": "risultato",
+            "results": "risultati",
+            "completed": "completato",
+            "folder": "cartella",
+            "data": "dati",
+            "history": "storia",
+            "empty": "vuoto",
+            "cleared": "pulita",
+            "removed": "rimossa",
+            "added": "aggiunta",
+            "updated": "modificata",
+            "active": "attivo",
+            "disabled": "disattivato"
+        }
+
+        self._runtime_phrase_replacements_it_to_en = sorted(
+            self._runtime_phrase_map_it_to_en.items(),
+            key=lambda item: len(item[0]),
+            reverse=True
+        )
+        self._runtime_phrase_replacements_en_to_it = sorted(
+            self._runtime_phrase_map_en_to_it.items(),
+            key=lambda item: len(item[0]),
+            reverse=True
+        )
+
+    def _localize_runtime_text(self, text):
+        """Localizza testo runtime (messaggi, titoli, status)"""
+        if not isinstance(text, str) or not text.strip():
+            return text
+
+        localized_text = text
+        language_code = (self.current_language or "").lower()
+
+        if language_code.startswith('en'):
+            for source, target in self._runtime_phrase_replacements_it_to_en:
+                localized_text = localized_text.replace(source, target)
+
+            for source, target in self._runtime_word_map_it_to_en.items():
+                localized_text = re.sub(rf'\b{re.escape(source)}\b', target, localized_text)
+
+        elif language_code.startswith('it'):
+            for source, target in self._runtime_phrase_replacements_en_to_it:
+                localized_text = localized_text.replace(source, target)
+
+            for source, target in self._runtime_word_map_en_to_it.items():
+                localized_text = re.sub(rf'\b{re.escape(source)}\b', target, localized_text)
+
+        return localized_text
+
+    def _patch_messagebox_functions(self):
+        """Patching messagebox per traduzione automatica"""
+        function_names = [
+            'showinfo', 'showwarning', 'showerror',
+            'askyesno', 'askokcancel', 'askretrycancel',
+            'askquestion', 'askyesnocancel'
+        ]
+
+        if getattr(messagebox, '_snmpbrowser_localized', False):
+            messagebox._snmpbrowser_localizer = self._localize_runtime_text
+            return
+
+        messagebox._snmpbrowser_localizer = self._localize_runtime_text
+
+        for function_name in function_names:
+            original_function = getattr(messagebox, function_name, None)
+            if not callable(original_function):
+                continue
+
+            def make_wrapper(function_to_wrap):
+                def wrapped(*args, **kwargs):
+                    localizer = getattr(messagebox, '_snmpbrowser_localizer', None)
+                    if localizer:
+                        args = list(args)
+                        if len(args) >= 1 and isinstance(args[0], str):
+                            args[0] = localizer(args[0])
+                        if len(args) >= 2 and isinstance(args[1], str):
+                            args[1] = localizer(args[1])
+
+                        for key in ('title', 'message', 'detail'):
+                            if key in kwargs and isinstance(kwargs[key], str):
+                                kwargs[key] = localizer(kwargs[key])
+
+                    return function_to_wrap(*tuple(args), **kwargs)
+
+                return wrapped
+
+            setattr(messagebox, function_name, make_wrapper(original_function))
+
+        messagebox._snmpbrowser_localized = True
+
+    def _patch_filedialog_functions(self):
+        """Patching filedialog per localizzare i titoli"""
+        function_names = [
+            'askopenfilename', 'askopenfilenames', 'asksaveasfilename', 'askdirectory'
+        ]
+
+        if getattr(filedialog, '_snmpbrowser_localized', False):
+            filedialog._snmpbrowser_localizer = self._localize_runtime_text
+            return
+
+        filedialog._snmpbrowser_localizer = self._localize_runtime_text
+
+        for function_name in function_names:
+            original_function = getattr(filedialog, function_name, None)
+            if not callable(original_function):
+                continue
+
+            def make_wrapper(function_to_wrap):
+                def wrapped(*args, **kwargs):
+                    localizer = getattr(filedialog, '_snmpbrowser_localizer', None)
+                    if localizer and 'title' in kwargs and isinstance(kwargs['title'], str):
+                        kwargs['title'] = localizer(kwargs['title'])
+                    return function_to_wrap(*args, **kwargs)
+
+                return wrapped
+
+            setattr(filedialog, function_name, make_wrapper(original_function))
+
+        filedialog._snmpbrowser_localized = True
+
+    def _patch_simpledialog_functions(self):
+        """Patching simpledialog per localizzare title/prompt"""
+        function_names = ['askstring', 'askinteger', 'askfloat']
+
+        if getattr(simpledialog, '_snmpbrowser_localized', False):
+            simpledialog._snmpbrowser_localizer = self._localize_runtime_text
+            return
+
+        simpledialog._snmpbrowser_localizer = self._localize_runtime_text
+
+        for function_name in function_names:
+            original_function = getattr(simpledialog, function_name, None)
+            if not callable(original_function):
+                continue
+
+            def make_wrapper(function_to_wrap):
+                def wrapped(*args, **kwargs):
+                    localizer = getattr(simpledialog, '_snmpbrowser_localizer', None)
+                    if localizer:
+                        args = list(args)
+                        if len(args) >= 1 and isinstance(args[0], str):
+                            args[0] = localizer(args[0])
+                        if len(args) >= 2 and isinstance(args[1], str):
+                            args[1] = localizer(args[1])
+                        if 'title' in kwargs and isinstance(kwargs['title'], str):
+                            kwargs['title'] = localizer(kwargs['title'])
+                        if 'prompt' in kwargs and isinstance(kwargs['prompt'], str):
+                            kwargs['prompt'] = localizer(kwargs['prompt'])
+                    return function_to_wrap(*tuple(args), **kwargs)
+
+                return wrapped
+
+            setattr(simpledialog, function_name, make_wrapper(original_function))
+
+        simpledialog._snmpbrowser_localized = True
+
+    def _patch_window_title_functions(self):
+        """Patching Tk/Toplevel.title per localizzare titoli finestre"""
+        if getattr(tk, '_snmpbrowser_title_localized', False):
+            tk._snmpbrowser_title_localizer = self._localize_runtime_text
+            return
+
+        tk._snmpbrowser_title_localizer = self._localize_runtime_text
+
+        original_tk_title = tk.Tk.title
+        original_toplevel_title = tk.Toplevel.title
+
+        def localized_tk_title(window, *args):
+            if args:
+                title_value = args[0]
+                localizer = getattr(tk, '_snmpbrowser_title_localizer', None)
+                if localizer and isinstance(title_value, str):
+                    title_value = localizer(title_value)
+                if len(args) == 1:
+                    return original_tk_title(window, title_value)
+                return original_tk_title(window, title_value, *args[1:])
+            return original_tk_title(window)
+
+        def localized_toplevel_title(window, *args):
+            if args:
+                title_value = args[0]
+                localizer = getattr(tk, '_snmpbrowser_title_localizer', None)
+                if localizer and isinstance(title_value, str):
+                    title_value = localizer(title_value)
+                if len(args) == 1:
+                    return original_toplevel_title(window, title_value)
+                return original_toplevel_title(window, title_value, *args[1:])
+            return original_toplevel_title(window)
+
+        tk.Tk.title = localized_tk_title
+        tk.Toplevel.title = localized_toplevel_title
+        tk._snmpbrowser_title_localized = True
+
     def create_menu(self):
         """Crea menu principale con opzioni monitoring"""
         menubar = tk.Menu(self.root)
@@ -957,54 +1542,62 @@ class SnmpBrowserGUI:
 
         # Menu File
         file_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="File", menu=file_menu)
-        file_menu.add_command(label="Salva Configurazione", command=self.save_config, accelerator="Ctrl+S")
-        file_menu.add_command(label="Carica Configurazione", command=self.load_config_dialog, accelerator="Ctrl+O")
+        menubar.add_cascade(label=self._("file", "File"), menu=file_menu)
+        file_menu.add_command(label=self._("save_configuration", "Save Configuration"), command=self.save_config,
+                              accelerator="Ctrl+S")
+        file_menu.add_command(label=self._("load_configuration", "Load Configuration"),
+                              command=self.load_config_dialog, accelerator="Ctrl+O")
         file_menu.add_separator()
-        file_menu.add_command(label="Esporta Risultati", command=self.export_results, accelerator="Ctrl+E")
+        file_menu.add_command(label=self._("export_results", "Export Results"), command=self.export_results,
+                              accelerator="Ctrl+E")
         file_menu.add_separator()
-        file_menu.add_command(label="Visualizza Log", command=self.show_log_viewer)
+        file_menu.add_command(label=self._("view_logs", "View Logs"), command=self.show_log_viewer)
         file_menu.add_separator()
-        file_menu.add_command(label="Esci", command=self.on_closing, accelerator="Ctrl+Q")
+        file_menu.add_command(label=self._("exit", "Exit"), command=self.on_closing, accelerator="Ctrl+Q")
 
         # NUOVO: Menu Monitoring
         monitor_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Monitoring", menu=monitor_menu)
-        monitor_menu.add_command(label="Gestisci Regole Alert", command=self.manage_rules)
-        monitor_menu.add_command(label="📧 Configura Email", command=self.configure_email)
-        monitor_menu.add_command(label="📊 Visualizza Alert History", command=self.show_alert_history)
+        monitor_menu.add_command(label="Manage Alert Rules", command=self.manage_rules)
+        monitor_menu.add_command(label="📧 Configure Email", command=self.configure_email)
+        monitor_menu.add_command(label="📊 View Alert History", command=self.show_alert_history)
         monitor_menu.add_separator()
-        monitor_menu.add_command(label="🧹 Pulisci Alert", command=self.clear_alerts)
+        monitor_menu.add_command(label="🧹 Clear Alerts", command=self.clear_alerts)
 
         # Menu Tools
         tools_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Tools", menu=tools_menu)
-        tools_menu.add_command(label="🔌 Test Connessione", command=self.test_connection, accelerator="Ctrl+T")
-        tools_menu.add_command(label="🌊 SNMP Walk Completo", command=self.full_walk)
-        tools_menu.add_command(label="🧹 Pulisci Cache", command=self.clear_cache)
+        menubar.add_cascade(label=self._("tools", "Tools"), menu=tools_menu)
+        tools_menu.add_command(label=f"🔌 {self._('test_connection', 'Test Connection')}",
+                               command=self.test_connection, accelerator="Ctrl+T")
+        tools_menu.add_command(label=f"🌊 {self._('full_snmp_walk', 'Full SNMP Walk')}", command=self.full_walk)
+        tools_menu.add_command(label=f"🧹 {self._('clear_cache', 'Clear Cache')}", command=self.clear_cache)
         tools_menu.add_separator()
-        tools_menu.add_command(label="📥 Importa MIB Custom", command=self.import_mib)  # ← QUESTA
-        tools_menu.add_command(label="📚 Gestisci MIB", command=self.manage_custom_mibs)  # ← E QUESTA!
+        tools_menu.add_command(label="📥 Import Custom MIB", command=self.import_mib)
+        tools_menu.add_command(label="📚 Manage MIB", command=self.manage_custom_mibs)
         tools_menu.add_separator()
-        tools_menu.add_command(label="🔐 Wizard SNMPv3", command=self.show_snmpv3_wizard)
-        tools_menu.add_command(label="🎯 Scopri Engine ID", command=self.discover_engine_id)
+        tools_menu.add_command(label=f"🔐 {self._('snmpv3_wizard', 'SNMPv3 Wizard')}",
+                               command=self.show_snmpv3_wizard)
+        tools_menu.add_command(label=f"🎯 {self._('discover_engine_id', 'Discover Engine ID')}",
+                               command=self.discover_engine_id)
         tools_menu.add_separator()
-        tools_menu.add_command(label="💾 Salva Dati Storici", command=self.save_historical_data)
-        tools_menu.add_command(label="🧹 Pulisci Dati Vecchi", command=self.clean_old_historical_data)
+        tools_menu.add_command(label="💾 Save Historical Data", command=self.save_historical_data)
+        tools_menu.add_command(label="🧹 Clean Old Data", command=self.clean_old_historical_data)
         tools_menu.add_separator()
-        tools_menu.add_command(label="📁 Posizione Dati", command=self.show_data_location)
-        tools_menu.add_command(label="📂 Apri Cartella Dati", command=self.open_data_folder)
+        tools_menu.add_command(label="📁 Data Location", command=self.show_data_location)
+        tools_menu.add_command(label="📂 Open Data Folder", command=self.open_data_folder)
         tools_menu.add_separator()
-        tools_menu.add_command(label="⚙️ Impostazioni", command=self.show_settings)
+        tools_menu.add_command(label=f"⚙️ {self._('settings', 'Settings')}", command=self.show_settings)
 
         # Menu Help
         help_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Help", menu=help_menu)
-        help_menu.add_command(label="📚 Guida", command=self.show_help, accelerator="F1")
-        help_menu.add_command(label="⌨️ Shortcuts", command=self.show_shortcuts)
-        help_menu.add_command(label="🐛 Debug Info", command=self.show_debug_info)
+        menubar.add_cascade(label=self._("help", "Help"), menu=help_menu)
+        help_menu.add_command(label="📚 Help", command=self.show_help, accelerator="F1")
+        help_menu.add_command(label=f"⌨️ {self._('shortcuts', 'Shortcuts')}", command=self.show_shortcuts)
+        help_menu.add_command(label=f"🐛 {self._('debug_info', 'Debug Info')}", command=self.show_debug_info)
         help_menu.add_separator()
-        help_menu.add_command(label="ℹ️ Info", command=self.show_about)
+        help_menu.add_command(label=f"🌍 {self._('language', 'Language')}", command=self.show_language_selector)
+        help_menu.add_separator()
+        help_menu.add_command(label=f"ℹ️ {self._('about', 'About')}", command=self.show_about)
 
     def import_mib(self):
         """Importa e parsa file MIB custom"""
@@ -1349,22 +1942,22 @@ class SnmpBrowserGUI:
 
     def create_config_frame(self, parent):
         """Frame configurazione con validazione"""
-        config_frame = ttk.LabelFrame(parent, text="🔧 Configurazione SNMP")
+        config_frame = ttk.LabelFrame(parent, text=f"🔧 {self._('snmp_configuration', 'SNMP Configuration')}")
         config_frame.pack(fill=tk.X, pady=(0, 5))
 
         # Prima riga
         row1 = ttk.Frame(config_frame)
         row1.pack(fill=tk.X, padx=5, pady=5)
 
-        ttk.Label(row1, text="Host:").pack(side=tk.LEFT)
+        ttk.Label(row1, text=f"{self._('host', 'Host')}:").pack(side=tk.LEFT)
         self.host_entry = ttk.Entry(row1, textvariable=self.host_var, width=15)
         self.host_entry.pack(side=tk.LEFT, padx=(5, 10))
 
-        ttk.Label(row1, text="Porta:").pack(side=tk.LEFT)
+        ttk.Label(row1, text=f"{self._('port', 'Port')}:").pack(side=tk.LEFT)
         self.port_entry = ttk.Entry(row1, textvariable=self.port_var, width=6)
         self.port_entry.pack(side=tk.LEFT, padx=(5, 10))
 
-        ttk.Label(row1, text="Versione:").pack(side=tk.LEFT)
+        ttk.Label(row1, text=f"{self._('version', 'Version')}:").pack(side=tk.LEFT)
         version_combo = ttk.Combobox(row1, textvariable=self.version_var, width=5,
                                      values=["1", "2c", "3"], state='readonly')
         version_combo.pack(side=tk.LEFT, padx=(5, 10))
@@ -1373,51 +1966,54 @@ class SnmpBrowserGUI:
         self.v1v2_frame = ttk.Frame(row1)
         self.v1v2_frame.pack(side=tk.LEFT, padx=(10, 0))
 
-        ttk.Label(self.v1v2_frame, text="Community:").pack(side=tk.LEFT)
+        ttk.Label(self.v1v2_frame, text=f"{self._('community', 'Community')}:").pack(side=tk.LEFT)
         ttk.Entry(self.v1v2_frame, textvariable=self.community_var, width=10).pack(side=tk.LEFT, padx=(5, 10))
 
         # Seconda riga
         row2 = ttk.Frame(config_frame)
         row2.pack(fill=tk.X, padx=5, pady=(0, 5))
 
-        ttk.Label(row2, text="Timeout:").pack(side=tk.LEFT)
+        ttk.Label(row2, text=f"{self._('timeout', 'Timeout')}:").pack(side=tk.LEFT)
         ttk.Entry(row2, textvariable=self.timeout_var, width=6).pack(side=tk.LEFT, padx=(5, 10))
 
-        ttk.Label(row2, text="Retry:").pack(side=tk.LEFT)
+        ttk.Label(row2, text=f"{self._('retries', 'Retries')}:").pack(side=tk.LEFT)
         ttk.Entry(row2, textvariable=self.retries_var, width=6).pack(side=tk.LEFT, padx=(5, 10))
 
-        ttk.Checkbutton(row2, text="Scansione Estesa",
+        ttk.Checkbutton(row2, text=self._("extended_scan", "Extended Scan"),
                         variable=self.extended_scan_var).pack(side=tk.LEFT, padx=(20, 10))
 
         # Pulsanti
         btn_frame = ttk.Frame(row2)
         btn_frame.pack(side=tk.RIGHT, padx=5)
 
-        self.scan_btn = ttk.Button(btn_frame, text="Start Scan", command=self.start_scan)
+        self.scan_btn = ttk.Button(btn_frame, text=self._("start_scan", "Start Scan"), command=self.start_scan)
         self.scan_btn.pack(side=tk.LEFT, padx=2)
 
-        self.stop_btn = ttk.Button(btn_frame, text="⏹️ Stop", command=self.stop_scan, state=tk.DISABLED)
+        self.stop_btn = ttk.Button(btn_frame, text=f"⏹️ {self._('stop', 'Stop')}", command=self.stop_scan,
+                                   state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=2)
 
-        ttk.Button(btn_frame, text="🔌 Test", command=self.test_connection).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text=f"🔌 {self._('test', 'Test')}", command=self.test_connection).pack(side=tk.LEFT,
+                                                                                                      padx=2)
 
         # Frame SNMPv3
-        self.v3_frame = ttk.LabelFrame(config_frame, text="🔐 Configurazione SNMPv3")
+        self.v3_frame = ttk.LabelFrame(config_frame,
+                                       text=f"🔐 {self._('snmpv3_configuration', 'SNMPv3 Configuration')}")
 
         # Prima riga v3
         v3_row1 = ttk.Frame(self.v3_frame)
         v3_row1.pack(fill=tk.X, padx=5, pady=5)
 
-        ttk.Label(v3_row1, text="Username:").pack(side=tk.LEFT)
+        ttk.Label(v3_row1, text=f"{self._('username', 'Username')}:").pack(side=tk.LEFT)
         ttk.Entry(v3_row1, textvariable=self.v3_user_var, width=15).pack(side=tk.LEFT, padx=(5, 10))
 
-        ttk.Label(v3_row1, text="Auth:").pack(side=tk.LEFT)
+        ttk.Label(v3_row1, text=f"{self._('auth', 'Auth')}:").pack(side=tk.LEFT)
         auth_combo = ttk.Combobox(v3_row1, textvariable=self.v3_auth_protocol_var, width=10,
                                   values=["noAuth", "MD5", "SHA", "SHA256", "SHA384", "SHA512"])
         auth_combo.pack(side=tk.LEFT, padx=(5, 10))
         auth_combo.state(['readonly'])
 
-        ttk.Label(v3_row1, text="Auth Pass:").pack(side=tk.LEFT)
+        ttk.Label(v3_row1, text=f"{self._('auth_pass', 'Auth Pass')}:").pack(side=tk.LEFT)
         self.auth_pass_entry = ttk.Entry(v3_row1, textvariable=self.v3_auth_password_var,
                                          width=15, show="*")
         self.auth_pass_entry.pack(side=tk.LEFT, padx=(5, 10))
@@ -1426,30 +2022,30 @@ class SnmpBrowserGUI:
         v3_row2 = ttk.Frame(self.v3_frame)
         v3_row2.pack(fill=tk.X, padx=5, pady=(0, 5))
 
-        ttk.Label(v3_row2, text="Priv:").pack(side=tk.LEFT)
+        ttk.Label(v3_row2, text=f"{self._('priv', 'Priv')}:").pack(side=tk.LEFT)
         priv_combo = ttk.Combobox(v3_row2, textvariable=self.v3_priv_protocol_var, width=10,
                                   values=["noPriv", "DES", "AES128", "AES192", "AES256"])
         priv_combo.pack(side=tk.LEFT, padx=(5, 10))
         priv_combo.state(['readonly'])
 
-        ttk.Label(v3_row2, text="Priv Pass:").pack(side=tk.LEFT)
+        ttk.Label(v3_row2, text=f"{self._('priv_pass', 'Priv Pass')}:").pack(side=tk.LEFT)
         self.priv_pass_entry = ttk.Entry(v3_row2, textvariable=self.v3_priv_password_var,
                                          width=15, show="*")
         self.priv_pass_entry.pack(side=tk.LEFT, padx=(5, 10))
 
-        ttk.Checkbutton(v3_row2, text="👀 Mostra",
+        ttk.Checkbutton(v3_row2, text=f"👀 {self._('show', 'Show')}",
                         variable=self.v3_show_passwords,
                         command=self.toggle_password_visibility).pack(side=tk.LEFT, padx=(10, 5))
 
-        ttk.Button(v3_row2, text="🎯 Engine ID",
+        ttk.Button(v3_row2, text=f"🎯 {self._('engine_id', 'Engine ID')}",
                    command=self.discover_engine_id).pack(side=tk.LEFT, padx=5)
 
-        ttk.Button(v3_row2, text="⚡ Test v3",
+        ttk.Button(v3_row2, text=f"⚡ {self._('test_v3', 'Test v3')}",
                    command=self.test_snmpv3_connection).pack(side=tk.LEFT, padx=5)
 
     def create_alert_status_frame(self, parent):
         """NUOVO: Crea il frame per mostrare lo stato degli alert"""
-        self.alert_frame = ttk.LabelFrame(parent, text="🚨 Stato Sistema & Alert")
+        self.alert_frame = ttk.LabelFrame(parent, text="🚨 System & Alert Status")
         self.alert_frame.pack(fill=tk.X, pady=(0, 5))
 
         status_container = ttk.Frame(self.alert_frame)
@@ -1461,23 +2057,29 @@ class SnmpBrowserGUI:
         self.update_status_indicator("ok")
 
         # Label per stato testuale
-        self.alert_status_var = tk.StringVar(value="✅ Sistema OK - Nessun alert attivo")
+        self.alert_status_var = LocalizedStringVar(
+            value="✅ System OK - No active alerts",
+            localizer=self._localize_runtime_text
+        )
         self.alert_status_label = ttk.Label(status_container, textvariable=self.alert_status_var,
                                             font=('Segoe UI', 10, 'bold'))
         self.alert_status_label.pack(side=tk.LEFT, padx=5)
 
         # Contatori alert
-        self.alert_count_var = tk.StringVar(value="Alert: 0 | Regole: 0")
+        self.alert_count_var = LocalizedStringVar(
+            value="Alerts: 0 | Rules: 0",
+            localizer=self._localize_runtime_text
+        )
         ttk.Label(status_container, textvariable=self.alert_count_var).pack(side=tk.LEFT, padx=(20, 5))
 
         # Ultimo alert
-        self.last_alert_var = tk.StringVar(value="")
+        self.last_alert_var = LocalizedStringVar(value="", localizer=self._localize_runtime_text)
         ttk.Label(status_container, textvariable=self.last_alert_var).pack(side=tk.LEFT, padx=(20, 5))
 
         # Pulsanti alert
-        ttk.Button(status_container, text="📋 Vedi Alert",
+        ttk.Button(status_container, text="📋 Alert History",
                    command=self.show_alert_history).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(status_container, text="🔔 Configura Alert",
+        ttk.Button(status_container, text="🔔 Manage Alerts",
                    command=self.manage_rules).pack(side=tk.RIGHT, padx=2)
 
     def update_status_indicator(self, status):
@@ -1511,20 +2113,21 @@ class SnmpBrowserGUI:
     def create_browser_tab(self):
         """Tab Browser principale con supporto alert"""
         browser_frame = ttk.Frame(self.notebook)
-        self.notebook.add(browser_frame, text="🌐 Browser SNMP")
+        self.notebook.add(browser_frame, text=f"🌐 {self._('browser', 'Browser')}")
 
         # Filtri
-        filter_frame = ttk.LabelFrame(browser_frame, text="🔍 Filtri")
+        filter_frame = ttk.LabelFrame(browser_frame, text=f"🔍 {self._('filter', 'Filter')}")
         filter_frame.pack(fill=tk.X, padx=5, pady=5)
 
-        ttk.Label(filter_frame, text="Cerca:").pack(side=tk.LEFT, padx=5)
+        ttk.Label(filter_frame, text=f"{self._('search', 'Search')}:").pack(side=tk.LEFT, padx=5)
         self.filter_var.trace('w', self.apply_filter)
         filter_entry = ttk.Entry(filter_frame, textvariable=self.filter_var, width=30)
         filter_entry.pack(side=tk.LEFT, padx=5)
 
-        ttk.Button(filter_frame, text="🧹 Pulisci", command=self.clear_filter).pack(side=tk.LEFT, padx=5)
+        ttk.Button(filter_frame, text=f"🧹 {self._('clear', 'Clear')}", command=self.clear_filter).pack(side=tk.LEFT,
+                                                                                                         padx=5)
 
-        ttk.Checkbutton(filter_frame, text="Solo Errori",
+        ttk.Checkbutton(filter_frame, text="Only Errors",
                         variable=self.show_errors_var,
                         command=self.apply_filter).pack(side=tk.LEFT, padx=(20, 5))
 
@@ -1532,7 +2135,14 @@ class SnmpBrowserGUI:
         results_frame = ttk.Frame(browser_frame)
         results_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        columns = ("OID", "Nome", "Tipo", "Valore", "Stato", "Timestamp")
+        columns = (
+            "OID",
+            self._("name", "Name"),
+            self._("type", "Type"),
+            self._("value", "Value"),
+            self._("status", "Status"),
+            self._("timestamp", "Timestamp")
+        )
         self.results_tree = ttk.Treeview(results_frame, columns=columns, show="headings", height=15)
 
         for col in columns:
@@ -1549,13 +2159,15 @@ class SnmpBrowserGUI:
         action_frame = ttk.Frame(browser_frame)
         action_frame.pack(fill=tk.X, padx=5, pady=5)
 
-        ttk.Button(action_frame, text="➕ Dashboard", command=self.add_to_dashboard).pack(side=tk.LEFT, padx=2)
+        ttk.Button(action_frame, text=f"➕ {self._('dashboard', 'Dashboard')}",
+                   command=self.add_to_dashboard).pack(side=tk.LEFT, padx=2)
         ttk.Button(action_frame, text="🔍 GET", command=self.get_selected).pack(side=tk.LEFT, padx=2)
         ttk.Button(action_frame, text="✏️ SET", command=self.set_value).pack(side=tk.LEFT, padx=2)
         ttk.Button(action_frame, text="🚶 WALK", command=self.walk_from_selected).pack(side=tk.LEFT, padx=2)
-        ttk.Button(action_frame, text="🔔 Crea Regola", command=self.create_rule_from_selected).pack(side=tk.LEFT,
-                                                                                                    padx=2)
-        ttk.Button(action_frame, text="📤 Export", command=self.export_results).pack(side=tk.LEFT, padx=2)
+        ttk.Button(action_frame, text="🔔 Create Rule", command=self.create_rule_from_selected).pack(side=tk.LEFT,
+                                                                                                     padx=2)
+        ttk.Button(action_frame, text=f"📤 {self._('export', 'Export')}",
+                   command=self.export_results).pack(side=tk.LEFT, padx=2)
 
         # Bind eventi
         self.results_tree.bind("<Double-1>", self.on_result_double_click)
@@ -1564,18 +2176,21 @@ class SnmpBrowserGUI:
     def create_enhanced_dashboard_tab(self):
         """NUOVO: Tab Dashboard migliorato con grafici e indicatori"""
         dashboard_frame = ttk.Frame(self.notebook)
-        self.notebook.add(dashboard_frame, text="📊 Dashboard")
+        self.notebook.add(dashboard_frame, text=f"📊 {self._('dashboard', 'Dashboard')}")
 
         # Controlli
-        control_frame = ttk.LabelFrame(dashboard_frame, text="Controlli Dashboard")
+        control_frame = ttk.LabelFrame(dashboard_frame, text="Dashboard Controls")
         control_frame.pack(fill=tk.X, padx=5, pady=5)
 
-        ttk.Button(control_frame, text="🔄 Aggiorna", command=self.refresh_dashboard).pack(side=tk.LEFT, padx=5, pady=5)
-        ttk.Button(control_frame, text="📊 Grafico", command=self.show_dashboard_graph).pack(side=tk.LEFT, padx=5)
-        ttk.Button(control_frame, text="🔔 Aggiungi Regola", command=self.add_rule_to_selected).pack(side=tk.LEFT,
-                                                                                                    padx=5)
-        ttk.Button(control_frame, text="🗑️ Rimuovi", command=self.remove_from_dashboard).pack(side=tk.LEFT, padx=5)
-        ttk.Button(control_frame, text="🧹 Pulisci", command=self.clear_dashboard).pack(side=tk.LEFT, padx=5)
+        ttk.Button(control_frame, text=f"🔄 {self._('refresh', 'Refresh')}",
+                   command=self.refresh_dashboard).pack(side=tk.LEFT, padx=5, pady=5)
+        ttk.Button(control_frame, text="📊 Graph", command=self.show_dashboard_graph).pack(side=tk.LEFT, padx=5)
+        ttk.Button(control_frame, text="🔔 Add Rule", command=self.add_rule_to_selected).pack(side=tk.LEFT,
+                                                                                              padx=5)
+        ttk.Button(control_frame, text=f"🗑️ {self._('remove', 'Remove')}",
+                   command=self.remove_from_dashboard).pack(side=tk.LEFT, padx=5)
+        ttk.Button(control_frame, text=f"🧹 {self._('clear', 'Clear')}",
+                   command=self.clear_dashboard).pack(side=tk.LEFT, padx=5)
 
         # Auto-refresh ATTIVO DI DEFAULT
         ttk.Checkbutton(control_frame, text="🔄 Auto-Refresh (30s)",
@@ -1583,7 +2198,7 @@ class SnmpBrowserGUI:
                         command=self.toggle_auto_refresh).pack(side=tk.LEFT, padx=(20, 5))
 
         # Intervallo refresh personalizzabile
-        ttk.Label(control_frame, text="Intervallo (s):").pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Label(control_frame, text="Interval (s):").pack(side=tk.LEFT, padx=(10, 2))
         interval_spin = ttk.Spinbox(control_frame, from_=5, to=300, increment=5,
                                     textvariable=self.refresh_interval_var, width=8)
         interval_spin.pack(side=tk.LEFT, padx=2)
@@ -1597,16 +2212,25 @@ class SnmpBrowserGUI:
         paned.add(left_frame, weight=3)
 
         # TreeView migliorato
-        dash_columns = ("Host", "OID", "Nome", "Valore", "Timestamp", "Stato", "Alert", "Trend")
+        dash_columns = (
+            self._("host", "Host"),
+            "OID",
+            self._("name", "Name"),
+            self._("value", "Value"),
+            self._("timestamp", "Timestamp"),
+            self._("status", "Status"),
+            "Alert",
+            "Trend"
+        )
         self.dashboard_tree = ttk.Treeview(left_frame, columns=dash_columns, show="headings", height=15)
 
         # Configurazione colonne
-        self.dashboard_tree.heading("Host", text="Host")
+        self.dashboard_tree.heading(self._("host", "Host"), text=self._("host", "Host"))
         self.dashboard_tree.heading("OID", text="OID")
-        self.dashboard_tree.heading("Nome", text="Nome")
-        self.dashboard_tree.heading("Valore", text="Valore")
-        self.dashboard_tree.heading("Timestamp", text="Aggiornamento")
-        self.dashboard_tree.heading("Stato", text="Stato")
+        self.dashboard_tree.heading(self._("name", "Name"), text=self._("name", "Name"))
+        self.dashboard_tree.heading(self._("value", "Value"), text=self._("value", "Value"))
+        self.dashboard_tree.heading(self._("timestamp", "Timestamp"), text=self._("timestamp", "Timestamp"))
+        self.dashboard_tree.heading(self._("status", "Status"), text=self._("status", "Status"))
         self.dashboard_tree.heading("Alert", text="🔔")
         self.dashboard_tree.heading("Trend", text="📈")
 
@@ -1625,7 +2249,7 @@ class SnmpBrowserGUI:
         dash_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         # Frame destro per mini-grafici e statistiche
-        right_frame = ttk.LabelFrame(paned, text="📈 Anteprima Dati")
+        right_frame = ttk.LabelFrame(paned, text="📈 Data Preview")
         paned.add(right_frame, weight=1)
 
         # Canvas per mini-grafico
@@ -1642,26 +2266,26 @@ class SnmpBrowserGUI:
     def create_mib_tree_tab(self):
         """Tab Albero MIB CORRETTO"""
         mib_frame = ttk.Frame(self.notebook)
-        self.notebook.add(mib_frame, text="🌳 Albero MIB")
+        self.notebook.add(mib_frame, text=f"🌳 {self._('mib_tree', 'MIB Tree')}")
 
         # Controlli
-        control_frame = ttk.LabelFrame(mib_frame, text="Controlli Albero MIB")
+        control_frame = ttk.LabelFrame(mib_frame, text="MIB Tree Controls")
         control_frame.pack(fill=tk.X, padx=5, pady=5)
 
-        ttk.Button(control_frame, text="🔄 Costruisci", command=self.build_mib_tree).pack(side=tk.LEFT, padx=5, pady=5)
-        ttk.Button(control_frame, text="➕ Espandi", command=self.expand_all_mib).pack(side=tk.LEFT, padx=5)
-        ttk.Button(control_frame, text="➖ Comprimi", command=self.collapse_all_mib).pack(side=tk.LEFT, padx=5)
+        ttk.Button(control_frame, text="🔄 Build", command=self.build_mib_tree).pack(side=tk.LEFT, padx=5, pady=5)
+        ttk.Button(control_frame, text="➕ Expand", command=self.expand_all_mib).pack(side=tk.LEFT, padx=5)
+        ttk.Button(control_frame, text="➖ Collapse", command=self.collapse_all_mib).pack(side=tk.LEFT, padx=5)
 
         # TreeView
         tree_frame = ttk.Frame(mib_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         self.mib_tree = ttk.Treeview(tree_frame, columns=("oid", "type", "value", "status"), height=20)
-        self.mib_tree.heading("#0", text="Nome MIB")
+        self.mib_tree.heading("#0", text=f"{self._('name', 'Name')} MIB")
         self.mib_tree.heading("oid", text="OID")
-        self.mib_tree.heading("type", text="Tipo")
-        self.mib_tree.heading("value", text="Valore")
-        self.mib_tree.heading("status", text="Stato")
+        self.mib_tree.heading("type", text=self._("type", "Type"))
+        self.mib_tree.heading("value", text=self._("value", "Value"))
+        self.mib_tree.heading("status", text=self._("status", "Status"))
 
         self.mib_tree.column("#0", width=300)
         self.mib_tree.column("oid", width=200)
@@ -1685,14 +2309,17 @@ class SnmpBrowserGUI:
         self.progress = ttk.Progressbar(status_frame, mode='indeterminate')
         self.progress.pack(side=tk.LEFT, padx=(0, 10))
 
-        self.status_var = tk.StringVar(value="🟢 Pronto - Auto-refresh attivo (30s)")
+        self.status_var = LocalizedStringVar(
+            value=f"🟢 {self._('ready', 'Ready')} - Auto-refresh active (30s)",
+            localizer=self._localize_runtime_text
+        )
         ttk.Label(status_frame, textvariable=self.status_var).pack(side=tk.LEFT)
 
         # Info memoria
         self.memory_var = tk.StringVar(value="")
         ttk.Label(status_frame, textvariable=self.memory_var).pack(side=tk.LEFT, padx=(20, 0))
 
-        self.info_var = tk.StringVar(value="")
+        self.info_var = LocalizedStringVar(value="", localizer=self._localize_runtime_text)
         ttk.Label(status_frame, textvariable=self.info_var).pack(side=tk.RIGHT, padx=(0, 10))
 
         self.time_var = tk.StringVar()
@@ -2181,25 +2808,25 @@ class SnmpBrowserGUI:
         if has_alerts:
             self.alert_active = True
             self.update_status_indicator("alert")
-            self.alert_status_var.set("⚠️ ALERT ATTIVI - Verificare le regole violate")
+            self.alert_status_var.set("⚠️ ACTIVE ALERTS - Check triggered rules")
             self.alert_status_label.config(foreground="red")
         else:
             self.alert_active = False
             self.update_status_indicator("ok")
-            self.alert_status_var.set("✅ Sistema OK - Nessun alert attivo")
+            self.alert_status_var.set("✅ System OK - No active alerts")
             self.alert_status_label.config(foreground="green")
 
         # Aggiorna ultimo alert
         if self.alert_history:
             last = self.alert_history[-1]
-            self.last_alert_var.set(f"Ultimo: {last['rule']} ({last['timestamp'].strftime('%H:%M:%S')})")
+            self.last_alert_var.set(f"Last: {last['rule']} ({last['timestamp'].strftime('%H:%M:%S')})")
 
     def update_alert_counts(self):
         """NUOVO: Aggiorna i contatori degli alert"""
         total_rules = len(self.alert_rules)
         active_alerts = sum(1 for rule in self.alert_rules.values() if rule.is_triggered)
 
-        self.alert_count_var.set(f"Alert: {active_alerts}/{total_rules} | Storia: {len(self.alert_history)}")
+        self.alert_count_var.set(f"Alerts: {active_alerts}/{total_rules} | History: {len(self.alert_history)}")
 
     def show_alert_history(self):
         """NUOVO: Mostra la storia degli alert"""
@@ -3067,16 +3694,16 @@ class SnmpBrowserGUI:
             interval = 30000  # Default 30 secondi
 
         self.auto_refresh_timer = self.root.after(interval, self.start_auto_refresh)
-        self.status_var.set(f"🔄 Auto-refresh attivo ({self.refresh_interval_var.get()}s)")
-        self.logger.info(f"Auto-refresh attivato: {self.refresh_interval_var.get()}s")
+        self.status_var.set(f"🔄 Auto-refresh active ({self.refresh_interval_var.get()}s)")
+        self.logger.info(f"Auto-refresh enabled: {self.refresh_interval_var.get()}s")
 
     def stop_auto_refresh(self):
         """NUOVO: Ferma auto-refresh del dashboard"""
         if self.auto_refresh_timer:
             self.root.after_cancel(self.auto_refresh_timer)
             self.auto_refresh_timer = None
-        self.status_var.set("⏸️ Auto-refresh disattivato")
-        self.logger.info("Auto-refresh disattivato")
+        self.status_var.set("⏸️ Auto-refresh disabled")
+        self.logger.info("Auto-refresh disabled")
 
     # ==================== FUNZIONI DI SUPPORTO ====================
 
@@ -4207,7 +4834,8 @@ class SnmpBrowserGUI:
             'max_results': self.max_results_var.get(),
             'max_memory': self.max_memory_var.get(),
             'auto_refresh': self.auto_refresh_var.get(),
-            'refresh_interval': self.refresh_interval_var.get()
+            'refresh_interval': self.refresh_interval_var.get(),
+            'language': self.current_language
         }
 
         if self.version_var.get() == "3":
@@ -4234,6 +4862,10 @@ class SnmpBrowserGUI:
             if os.path.exists(self.config_file):
                 with open(self.config_file, 'r') as f:
                     config = json.load(f)
+
+                self.language_manager.set_language(config.get('language', 'en'))
+                self.current_language = self.language_manager.current_language
+                self.root.title(self._("app_title", "SNMP Browser - Production Ready"))
 
                 self.host_var.set(config.get('host', '192.168.1.1'))
                 self.community_var.set(config.get('community', 'public'))
@@ -4270,6 +4902,10 @@ class SnmpBrowserGUI:
                     self.v3_engine_id_var.set(config.get('v3_engine_id', ''))
 
                 self.logger.info("Configurazione caricata")
+            else:
+                self.language_manager.set_language('en')
+                self.current_language = self.language_manager.current_language
+                self.root.title(self._("app_title", "SNMP Browser - Production Ready"))
 
         except Exception as e:
             self.logger.error(f"Errore caricamento config: {e}")
@@ -4773,6 +5409,9 @@ Click Destro - Menu contestuale
                 self.version_var.set(config.get('version', '2c'))
                 self.timeout_var.set(config.get('timeout', '5.0'))
                 self.retries_var.set(config.get('retries', '3'))
+
+                if 'language' in config:
+                    self.set_language(config.get('language', 'en'), refresh_ui=True)
 
                 messagebox.showinfo("✅ Configurazione", "Configurazione caricata con successo!")
                 self.logger.info(f"Configurazione caricata da: {filename}")
